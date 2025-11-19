@@ -9,7 +9,6 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 from pycuda.autoinit import context
 from pycuda._driver import LogicError as CudaLogicError
-
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped, TransformStamped, Quaternion
@@ -17,7 +16,7 @@ from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 from common_msgs.msg import ConeArray, Cone
 
-DEBUG_GPU = True  # Kept True for your debugging
+DEBUG_GPU = True  # Set to False to reduce console spam
 
 # --- FastSLAM Core Library Imports ---
 try:
@@ -47,8 +46,6 @@ def print_gpu_stats(prefix=""):
     if not DEBUG_GPU:
         return
     free, total = cuda.mem_get_info()
-    # Optional: reduce spam by only printing if free memory is low
-    # if free > 1000 * 1024 * 1024: return 
     print(f"[GPU DEBUG] {prefix} | Free: {free/1e6:.2f} MB / Total: {total/1e6:.2f} MB")
 
 
@@ -73,9 +70,9 @@ def check_and_memcpy_dtoh(host_arr, dev_ptr, name=""):
         raise RuntimeError(f"memcpy_dtoh failed for {name}: {e}")
 
 
-KERN_FLOAT = np.float32
-WEIGHT_DTYPE = np.float32
-INT_DTYPE = np.int32
+KERN_FLOAT = np.float64
+WEIGHT_DTYPE = np.float64
+INT_DTYPE = np.int64
 
 
 # ---------- Utility Functions ----------
@@ -111,7 +108,7 @@ def get_cone_color(cone_type: int):
     elif cone_type in [Cone.ORANGE, Cone.LARGE_ORANGE]:
         color["r"], color["g"], color["b"] = 1.0, 0.5, 0.0
     else:
-        # Gray for unknown
+        # Default to Gray for Unknown/SLAM-Map cones
         color["r"], color["g"], color["b"] = 0.5, 0.5, 0.5
     return color
 
@@ -122,28 +119,28 @@ class FastSLAMCore:
         self.config = config
         self.N = int(config.N)
         self.THREADS = int(config.THREADS)
-        
-        # --- FIX: Robust Integer Safety ---
-        # Handle missing attribute OR explicit None
-        raw_limit = getattr(config, 'MAX_SENSOR_MEASUREMENTS', 100)
-        self.MAX_MEASUREMENTS = 100 if raw_limit is None else int(raw_limit)
+        print(f'choosen N: {self.N}')
 
-        print(f"[DEBUG] Sensor Limit set to: {self.MAX_MEASUREMENTS}")
+        # Handle case where config is missing the variable or it is None
+        self.MAX_MEASUREMENTS = config.sensor.MAX_MEASUREMENTS
+        print(f"Sensor measurement limit set to: {self.MAX_MEASUREMENTS}")
 
         self.particles = FlatParticle.get_initial_particles(
-            self.N, config.MAX_LANDMARKS, config.START_POSITION, sigma=0.2
+            self.N, config.MAX_LANDMARKS, config.START_POSITION.copy(), sigma=0.2
         ).astype(KERN_FLOAT)
+        print(f"Initial Partciles loaded")
 
         self.cuda_modules = load_cuda_modules(
             THREADS=self.THREADS,
             PARTICLE_SIZE=int(config.PARTICLE_SIZE),
             N_PARTICLES=self.N
         )
+        print(f"Cuda Modules loaded")
 
         self.memory = CUDAMemory(config)
-
         check_and_memcpy_htod(self.memory.cov, ensure_contiguous(config.sensor.COVARIANCE, KERN_FLOAT), name="covariance")
         check_and_memcpy_htod(self.memory.particles, ensure_contiguous(self.particles, KERN_FLOAT), name="particles")
+        print(f"Data moved from GPU successful")
 
         try:
             init_rng_func = self.cuda_modules["predict"].get_function("init_rng")
@@ -157,71 +154,68 @@ class FastSLAMCore:
         self.weights = np.zeros(self.N, dtype=WEIGHT_DTYPE)
 
     def execute_step(self, v_linear: float, omega_angular: float, measurements_rb: np.ndarray):
-        # --- CRASH FIX: Truncate Measurements ---
         if measurements_rb is None or len(measurements_rb) == 0:
             measurements_rb = np.zeros((0,2), dtype=KERN_FLOAT)
         else:
-            # Truncate to prevent buffer overflow
+            # Ensure MAX_MEASUREMENTS is valid int
+            if self.MAX_MEASUREMENTS is None:
+                self.MAX_MEASUREMENTS = 100
+            # Prevent GPU Crash by capping measurements
             if len(measurements_rb) > self.MAX_MEASUREMENTS:
-                # Optional: warn once or periodically if this happens often
-                # print(f"[WARN] Truncating cones: {len(measurements_rb)} -> {self.MAX_MEASUREMENTS}")
                 measurements_rb = measurements_rb[:self.MAX_MEASUREMENTS]
-                
             measurements_rb = ensure_contiguous(np.array(measurements_rb), KERN_FLOAT)
-            
+        print("Input Data given to Kernel")
         N_measurements = len(measurements_rb)
 
         # Reset Weights
         try:
-            func = self.cuda_modules["resample"].get_function("reset_weights")
-            func(self.memory.particles, block=(self.THREADS,1,1), grid=make_grid(self.N,self.THREADS))
+            reset_weights_func = self.cuda_modules["resample"].get_function("reset_weights")
+            reset_weights_func(self.memory.particles, block=(self.THREADS,1,1), grid=make_grid(self.N,self.THREADS))
             cuda.Context.synchronize()
-            print_gpu_stats("reset_weights")
+            print_gpu_stats("reset_weights successful")
         except Exception as e:
             raise RuntimeError(f"reset_weights kernel failed: {e}")
 
         # Prediction
         try:
-            func = self.cuda_modules["predict"].get_function("predict_from_model")
-            func(
+            prediction_func = self.cuda_modules["predict"].get_function("predict_from_model")
+            prediction_func(
                 self.memory.particles,
-                np.float32(omega_angular),
-                np.float32(v_linear),
-                np.float32(np.sqrt(self.config.CONTROL_VARIANCE[0])),
-                np.float32(np.sqrt(self.config.CONTROL_VARIANCE[1])),
-                np.float32(self.config.DT),
+                np.float64(omega_angular),
+                np.float64(v_linear),
+                np.float64(np.sqrt(self.config.CONTROL_VARIANCE[0])),
+                np.float64(np.sqrt(self.config.CONTROL_VARIANCE[1])),
+                np.float64(self.config.DT),
                 block=(self.THREADS,1,1),
                 grid=make_grid(self.N,self.THREADS)
             )
             cuda.Context.synchronize()
-            print_gpu_stats("predict_from_model")
+            print_gpu_stats("predict_from_model successful")
         except Exception as e:
             raise RuntimeError(f"predict_from_model failed: {e}")
 
-        # Measurement Update
+        # Update
         if N_measurements > 0:
             try:
                 check_and_memcpy_htod(self.memory.measurements, measurements_rb, name="measurements")
-                block_size = min(self.N,32)
-                func = self.cuda_modules["update"].get_function("update")
-                func(
+                update_func = self.cuda_modules["update"].get_function("update")
+                update_func(
                     self.memory.particles,
-                    np.int32(self.N//block_size),
+                    np.int32(self.N// self.THREADS),
                     self.memory.scratchpad,
                     np.int32(self.memory.scratchpad_block_size),
                     self.memory.measurements,
                     np.int32(self.N),
                     np.int32(N_measurements),
-                    np.float32(self.config.sensor.COVARIANCE[0,0]),
-                    np.float32(self.config.THRESHOLD),
-                    np.float32(self.config.sensor.RANGE),
-                    np.float32(self.config.sensor.FOV),
+                    self.memory.cov,
+                    np.float64(self.config.THRESHOLD),
+                    np.float64(self.config.sensor.RANGE),
+                    np.float64(self.config.sensor.FOV),
                     np.int32(self.config.MAX_LANDMARKS),
-                    block=(block_size,1,1),
-                    grid=make_grid(self.N, block_size)
+                    block=(self.THREADS,1,1)
                 )
                 cuda.Context.synchronize()
-                print_gpu_stats("update kernel")
+                print_gpu_stats("update kernel successful")
             except Exception as e:
                 raise RuntimeError(f"update kernel or HtoD failed: {e}\n{traceback.format_exc()}")
 
@@ -236,8 +230,8 @@ class FastSLAMCore:
 
         # Compute Neff & Resample
         try:
-            func = self.cuda_modules["weights_and_mean"].get_function("get_weights")
-            func(self.memory.particles, self.memory.weights, block=(self.THREADS,1,1), grid=make_grid(self.N,self.THREADS))
+            weights_func = self.cuda_modules["weights_and_mean"].get_function("get_weights")
+            weights_func(self.memory.particles, self.memory.weights, block=(self.THREADS,1,1), grid=make_grid(self.N,self.THREADS))
             cuda.Context.synchronize()
             check_and_memcpy_dtoh(self.weights, self.memory.weights, name="weights")
             neff = FlatParticle.neff(self.weights.astype(np.float64))
@@ -254,6 +248,7 @@ class FastSLAMCore:
             best_idx = int(np.argmax(FlatParticle.w(self.particles)))
             best_landmarks = FlatParticle.get_landmarks(self.particles, best_idx)
             best_covariances = FlatParticle.get_covariances(self.particles, best_idx)
+            print("Post_Processing Particels successful")
         except Exception as e:
             raise RuntimeError(f"postprocessing particles failed: {e}")
 
@@ -261,6 +256,8 @@ class FastSLAMCore:
         for lm, cov in zip(best_landmarks, best_covariances):
             if not np.all(cov == 0) and not np.linalg.norm(lm) > 0.01:
                 final_map_data.append({"position": lm, "covariance": cov})
+        print(final_map_data)
+        print(estimated_pose)
 
         return estimated_pose, final_map_data
 
@@ -277,20 +274,26 @@ class FastSLAMNode(Node):
         # Publishers
         self.pose_pub = self.create_publisher(PoseStamped, "/slam/pose", 1)
         self.map_pub = self.create_publisher(MarkerArray, "/slam/cone_map", 1)
-        
+        # Subscribers
         self.odom_sub = Subscriber(self, Odometry, "/odom")
         self.cone_sub = Subscriber(self, ConeArray, "/perfect_cone_array")
 
-        self.ts = ApproximateTimeSynchronizer([self.odom_sub, self.cone_sub], queue_size=10, slop=0.05)
+        # Input topics Synchronizer
+        self.ts = ApproximateTimeSynchronizer([self.odom_sub, self.cone_sub], queue_size=20, slop=0.1)  # slop=0.1  allows ~0.1s mismatch
         self.ts.registerCallback(self.slam_callback)
         self.get_logger().info("Subscribers synchronized. Waiting for data...")
 
     def slam_callback(self, odom_msg: Odometry, cone_array_msg: ConeArray):
         v_linear = odom_msg.twist.twist.linear.x
         omega_angular = odom_msg.twist.twist.angular.z
-
-        measurements_rb, cone_types = self._process_cones(cone_array_msg)
+        rx = odom_msg.pose.pose.position.x
+        ry = odom_msg.pose.pose.position.y
+        rq = odom_msg.pose.pose.orientation
+        r_yaw = quaternion_to_yaw(rq.x, rq.y, rq.z, rq.w)
+         
+        measurements_rb, cone_types = self._process_cones(cone_array_msg, rx, ry, r_yaw)   # cone_types not being used yet in this code
         
+        # Skip update if stationary AND no valid measurements
         if v_linear == 0.0 and omega_angular == 0.0 and len(measurements_rb) == 0:
             return
 
@@ -305,9 +308,16 @@ class FastSLAMNode(Node):
         self._publish_map_markers(final_map_data)
         self._publish_pose_stamped(estimated_pose, odom_msg.header.stamp)
 
-    def _process_cones(self, cone_array_msg: ConeArray):
-        all_cones_rb = []
-        all_cone_types = []
+    def _process_cones(self, cone_array_msg: ConeArray, rx, ry, r_yaw):
+        """
+        Extracts cones. If frame_id is 'map', transforms them to 'base_link' 
+        so SLAM can process them as range/bearing.
+        """
+        all_cones_rb = []   # store [range, bearing] of all detected cones
+        all_cone_types = []  # store cone type of all detected cones as enum integer given in common_msgs/Cone.msg
+        
+        is_map_frame = (cone_array_msg.header.frame_id == "map")
+        
         cone_mapping = [
             (cone_array_msg.yellow_cones, Cone.YELLOW),
             (cone_array_msg.blue_cones, Cone.BLUE),
@@ -315,28 +325,45 @@ class FastSLAMNode(Node):
             (cone_array_msg.large_orange_cones, Cone.LARGE_ORANGE),
             (cone_array_msg.unknown_cones, Cone.UNKNOWN),
         ]
+        
         for cone_list, cone_type in cone_mapping:
             for cone in cone_list:
-                x = cone.position.x
-                y = cone.position.y
-                if abs(x) < 1e-3 and abs(y) < 1e-3:
+                cx, cy = cone.position.x, cone.position.y
+                
+                # Filter noise
+                if abs(cx) < 1e-3 and abs(cy) < 1e-3:
                     continue
-                r, beta = xy_to_range_bearing(x, y)
+                
+                if is_map_frame:
+                    # TRANSFORM: Global (Map) -> Local (Base Link)
+                    dx = cx - rx
+                    dy = cy - ry
+                    # Rotate into robot frame
+                    cos_v = math.cos(r_yaw)
+                    sin_v = math.sin(r_yaw)
+                    local_x = dx * cos_v + dy * sin_v
+                    local_y = -dx * sin_v + dy * cos_v
+                else:
+                    # Already local
+                    local_x, local_y = cx, cy
+
+                r, beta = xy_to_range_bearing(local_x, local_y)
                 all_cones_rb.append([r, beta])
                 all_cone_types.append(cone_type)
+                
         return np.array(all_cones_rb, dtype=KERN_FLOAT), all_cone_types
 
     def _publish_transforms(self, odom_msg: Odometry, estimated_pose: np.ndarray):
         x_map, y_map, theta_map = estimated_pose[0], estimated_pose[1], estimated_pose[2]
+        
         odom_x = odom_msg.pose.pose.position.x
         odom_y = odom_msg.pose.pose.position.y
         odom_q = odom_msg.pose.pose.orientation
         odom_theta = quaternion_to_yaw(odom_q.x, odom_q.y, odom_q.z, odom_q.w)
 
-        # Calculate Map -> Odom transform
-        # T_map_odom = T_map_base * T_base_odom
         delta_theta = theta_map - odom_theta
         
+        # Calculate the origin of the odom frame relative to the map frame
         t_x = x_map - (odom_x * math.cos(delta_theta) - odom_y * math.sin(delta_theta))
         t_y = y_map - (odom_x * math.sin(delta_theta) + odom_y * math.cos(delta_theta))
         
@@ -369,7 +396,7 @@ class FastSLAMNode(Node):
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "cones"
+            marker.ns = "slam_cones"
             marker.id = i
             marker.type = Marker.CYLINDER
             marker.action = Marker.ADD
@@ -377,13 +404,12 @@ class FastSLAMNode(Node):
             marker.pose.position.y = float(lm_data["position"][1])
             marker.pose.position.z = 0.5
             
-            # Use generic color for map landmarks to avoid flickering
-            cone_type = Cone.UNKNOWN 
-            
+            cone_type = lm_data["type"]
             color = get_cone_color(cone_type)
+            
             marker.scale.x = 0.2
             marker.scale.y = 0.2
-            marker.scale.z = 1.0
+            marker.scale.z = 0.5
             marker.color.a = color["a"]
             marker.color.r = color["r"]
             marker.color.g = color["g"]
