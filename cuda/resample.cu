@@ -6,6 +6,10 @@
 #define PARTICLE_SIZE <<PARTICLE_SIZE>>
 #define THREADS <<THREADS>>
 
+// --- ADDED: Calculate MAX_LANDMARKS safely from PARTICLE_SIZE ---
+#define MAX_LANDMARKS ((PARTICLE_SIZE - 6) / 8)
+// ---------------------------------------------------------------
+
 __device__ double* get_particle(double *particles, int i) {
     return (particles + PARTICLE_SIZE*i);
 }
@@ -25,26 +29,37 @@ __device__ double* get_particle(double *particles, int i) {
     double *source = get_particle(particles, ancestors[i]);
     double *dest = get_particle(particles, i);
 
-    int max_landmarks = (int)source[4];
+    // --- FIXED: Use the compile-time constant, not memory ---
+    int max_landmarks = MAX_LANDMARKS; 
+    // -------------------------------------------------------
+    
     int n_landmarks = (int)source[5];
 
+    // Copy Pose and Metadata
     dest[0] = source[0];
     dest[1] = source[1];
     dest[2] = source[2];
     dest[3] = source[3];
-    dest[4] = source[4];
+    dest[4] = source[4]; // Even if this is garbage, we copy it, but we don't rely on it for offsets
     dest[5] = source[5];
 
+    // Copy Landmarks
     for(int k = 0; k < n_landmarks; k++) {
-        dest[6+2*k] = source[6+2*k];
-        dest[6+2*k+1] = source[6+2*k+1];
+        // Means (2 doubles)
+        dest[6+2*k]     = source[6+2*k];
+        dest[6+2*k+1]   = source[6+2*k+1];
 
-        dest[6+2*max_landmarks+4*k] = source[6+2*max_landmarks+4*k];
-        dest[6+2*max_landmarks+4*k+1] = source[6+2*max_landmarks+4*k+1];
-        dest[6+2*max_landmarks+4*k+2] = source[6+2*max_landmarks+4*k+2];
-        dest[6+2*max_landmarks+4*k+3] = source[6+2*max_landmarks+4*k+3];
+        // Covariances (4 doubles) - Offset depends on MAX_LANDMARKS
+        dest[6+2*max_landmarks+4*k]     = source[6+2*max_landmarks+4*k];
+        dest[6+2*max_landmarks+4*k+1]   = source[6+2*max_landmarks+4*k+1];
+        dest[6+2*max_landmarks+4*k+2]   = source[6+2*max_landmarks+4*k+2];
+        dest[6+2*max_landmarks+4*k+3]   = source[6+2*max_landmarks+4*k+3];
 
-        dest[6+6*max_landmarks+k] = source[6+6*max_landmarks+k];
+        // Probabilities (1 double) - Offset depends on MAX_LANDMARKS
+        dest[6+6*max_landmarks+k]       = source[6+6*max_landmarks+k];
+
+        // --- NEW: Colors (1 double) - Offset = 2 + 4 + 1 = 7 ---
+        dest[6+7*max_landmarks+k]       = source[6+7*max_landmarks+k];
     }
 }
 
@@ -74,11 +89,16 @@ __global__ void reset_weights(double *particles) {
 __global__ void systematic_resample(double *weights, double *cumsum, double rand, int *ancestors) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     
+    // Safety check for bounds
+    if (i >= N_PARTICLES) return;
+    
     int left = ceil((cumsum[i]*N_PARTICLES - weights[i]*N_PARTICLES) - rand);
     int right = ceil((cumsum[i]*N_PARTICLES) - rand);
 
     for(int j = left; j < right; j++) {
-        ancestors[j] = i;
+        if(j >= 0 && j < N_PARTICLES) { // Safety check
+            ancestors[j] = i;
+        }
     }
 }
 

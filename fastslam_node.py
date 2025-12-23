@@ -5,10 +5,6 @@ import numpy as np
 import math
 import traceback
 
-import pycuda.driver as cuda
-import pycuda.autoinit
-from pycuda.autoinit import context
-from pycuda._driver import LogicError as CudaLogicError
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped, TransformStamped, Quaternion
@@ -16,9 +12,13 @@ from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 from common_msgs.msg import ConeArray, Cone
 
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.autoinit import context
+from pycuda._driver import LogicError as CudaLogicError
 DEBUG_GPU = True  # Set to False to reduce console spam
 
-# --- FastSLAM Core Library Imports ---
+# ------------------ FastSLAM Core Imports ------------------
 try:
     from .config_simulation import config
     from .lib.particle3 import FlatParticle
@@ -76,20 +76,17 @@ INT_DTYPE = np.int64
 
 
 # ---------- Utility Functions ----------
-def quaternion_to_yaw(q_x, q_y, q_z, q_w):
-    siny_cosp = 2.0 * (q_w * q_z + q_x * q_y)
-    cosy_cosp = 1.0 - 2.0 * (q_y*q_y + q_z*q_z)
+def quaternion_to_yaw(qx, qy, qz, qw):
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy*qy + qz*qz)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
 def yaw_to_quaternion(yaw: float) -> Quaternion:
-    cy = math.cos(yaw*0.5)
-    sy = math.sin(yaw*0.5)
     q = Quaternion()
-    q.x = 0.0
-    q.y = 0.0
-    q.z = sy
-    q.w = cy
+    q.x , q.y = 0.0, 0.0
+    q.z = math.sin(yaw*0.5)
+    q.w = math.cos(yaw*0.5)
     return q
 
 
@@ -97,7 +94,6 @@ def xy_to_range_bearing(x, y):
     r = math.sqrt(x**2 + y**2)
     beta = math.atan2(y, x)
     return r, beta
-
 
 def get_cone_color(cone_type: int):
     color = {"r":0.0, "g":0.0, "b":0.0, "a":1.0}
@@ -108,7 +104,7 @@ def get_cone_color(cone_type: int):
     elif cone_type in [Cone.ORANGE, Cone.LARGE_ORANGE]:
         color["r"], color["g"], color["b"] = 1.0, 0.5, 0.0
     else:
-        # Default to Gray for Unknown/SLAM-Map cones
+        # Default to Gray for Unknown
         color["r"], color["g"], color["b"] = 0.5, 0.5, 0.5
     return color
 
@@ -153,13 +149,13 @@ class FastSLAMCore:
 
         self.weights = np.zeros(self.N, dtype=WEIGHT_DTYPE)
 
-    def execute_step(self, v_linear: float, omega_angular: float, measurements_rb: np.ndarray):
+    def execute_step(self, v_linear: float, omega_angular: float, measurements_rb: np.ndarray, dt: float):
         if measurements_rb is None or len(measurements_rb) == 0:
-            measurements_rb = np.zeros((0,2), dtype=KERN_FLOAT)
+            measurements_rb = np.zeros((0,3), dtype=KERN_FLOAT)
         else:
             # Ensure MAX_MEASUREMENTS is valid int
             if self.MAX_MEASUREMENTS is None:
-                self.MAX_MEASUREMENTS = 100
+                self.MAX_MEASUREMENTS = 50
             # Prevent GPU Crash by capping measurements
             if len(measurements_rb) > self.MAX_MEASUREMENTS:
                 measurements_rb = measurements_rb[:self.MAX_MEASUREMENTS]
@@ -185,7 +181,7 @@ class FastSLAMCore:
                 np.float64(v_linear),
                 np.float64(np.sqrt(self.config.CONTROL_VARIANCE[0])),
                 np.float64(np.sqrt(self.config.CONTROL_VARIANCE[1])),
-                np.float64(self.config.DT),
+                np.float64(dt),                    #Using calculated dt
                 block=(self.THREADS,1,1),
                 grid=make_grid(self.N,self.THREADS)
             )
@@ -212,7 +208,8 @@ class FastSLAMCore:
                     np.float64(self.config.sensor.RANGE),
                     np.float64(self.config.sensor.FOV),
                     np.int32(self.config.MAX_LANDMARKS),
-                    block=(self.THREADS,1,1)
+                    block=(self.THREADS,1,1),
+                    grid=make_grid(self.N, self.THREADS)
                 )
                 cuda.Context.synchronize()
                 print_gpu_stats("update kernel successful")
@@ -235,7 +232,7 @@ class FastSLAMCore:
             cuda.Context.synchronize()
             check_and_memcpy_dtoh(self.weights, self.memory.weights, name="weights")
             neff = FlatParticle.neff(self.weights.astype(np.float64))
-            if neff < 0.6*self.N:
+            if neff < 0.3*self.N:
                 resample(self.cuda_modules, self.config, self.weights, self.memory, 0.5)
                 cuda.Context.synchronize()
                 print_gpu_stats("resample due to low Neff")
@@ -248,35 +245,52 @@ class FastSLAMCore:
             best_idx = int(np.argmax(FlatParticle.w(self.particles)))
             best_landmarks = FlatParticle.get_landmarks(self.particles, best_idx)
             best_covariances = FlatParticle.get_covariances(self.particles, best_idx)
+            best_colors = FlatParticle.get_colors(self.particles, best_idx)
+            
             print("Post_Processing Particels successful")
         except Exception as e:
             raise RuntimeError(f"postprocessing particles failed: {e}")
 
         final_map_data = []
-        for lm, cov in zip(best_landmarks, best_covariances):
-            if not np.all(cov == 0) and not np.linalg.norm(lm) > 0.01:
-                final_map_data.append({"position": lm, "covariance": cov})
+        # Zip safely (stops at the shortest list to prevent index errors)
+        limit = min(len(best_landmarks), len(best_colors))
+        
+        for i in range(limit):
+            lm = best_landmarks[i]
+            cov = best_covariances[i]
+            color_val = best_colors[i]
+            
+            # Filter uninitialized landmarks
+            if not np.all(cov == 0) and np.linalg.norm(lm[:2]) > 0.01:
+                final_map_data.append({
+                    "position": lm, 
+                    "covariance": cov, 
+                    "type": int(color_val)
+                })
         print(final_map_data)
         print(estimated_pose)
 
         return estimated_pose, final_map_data
 
-
 # ---------- ROS 2 Node ----------
 class FastSLAMNode(Node):
     def __init__(self):
         super().__init__("fastslam_node")
+        # Read the limit from the imported config file
+        self.MAX_MEASUREMENTS = config.sensor.MAX_MEASUREMENTS
         self.get_logger().info("FastSLAM Node Initializing...")
 
+        self.last_time = None      # Initialize variable to store previous time
         self.slam_core = FastSLAMCore(config)
         self.tf_broadcaster = TransformBroadcaster(self)
 
         # Publishers
         self.pose_pub = self.create_publisher(PoseStamped, "/slam/pose", 1)
-        self.map_pub = self.create_publisher(MarkerArray, "/slam/cone_map", 1)
+        self.cone_map_pub = self.create_publisher(ConeArray, "/slam/cone_map", 1)
+        self.map_markers_pub = self.create_publisher(MarkerArray, "/slam/cone_map_markers", 1)
         # Subscribers
         self.odom_sub = Subscriber(self, Odometry, "/odom")
-        self.cone_sub = Subscriber(self, ConeArray, "/perfect_cone_array")
+        self.cone_sub = Subscriber(self, ConeArray, "/cone_array")
 
         # Input topics Synchronizer
         self.ts = ApproximateTimeSynchronizer([self.odom_sub, self.cone_sub], queue_size=20, slop=0.1)  # slop=0.1  allows ~0.1s mismatch
@@ -291,33 +305,45 @@ class FastSLAMNode(Node):
         rq = odom_msg.pose.pose.orientation
         r_yaw = quaternion_to_yaw(rq.x, rq.y, rq.z, rq.w)
          
-        measurements_rb, cone_types = self._process_cones(cone_array_msg, rx, ry, r_yaw)   # cone_types not being used yet in this code
-        
+        measurements_rb = self._process_cones(cone_array_msg, rx, ry, r_yaw)   # cone_types not being used yet in this code
+        # Calculate DT
+        current_time = odom_msg.header.stamp.sec + odom_msg.header.stamp.nanosec * 1e-9
+        if self.last_time is None:
+            self.last_time = current_time
+            return               # Skip the first frame so we have a valid interval next time
+        dt = current_time - self.last_time
+        self.last_time = current_time
+        # Safety check for jumps or lag
+        if dt <= 0.0 or dt > 0.5: 
+            self.get_logger().warn(f"Abnormal DT detected: {dt:.4f}s. Resetting timer.")
+            return
+
         # Skip update if stationary AND no valid measurements
         if v_linear == 0.0 and omega_angular == 0.0 and len(measurements_rb) == 0:
             return
 
         try:
-            estimated_pose, final_map_data = self.slam_core.execute_step(v_linear, omega_angular, measurements_rb)
+            estimated_pose, final_map_data = self.slam_core.execute_step(v_linear, omega_angular, measurements_rb, dt)
         except Exception as e:
             self.get_logger().error(f"SLAM execution error: {e}")
             self.get_logger().debug(traceback.format_exc())
             return
 
+        # Execution
         self._publish_transforms(odom_msg, estimated_pose)
-        self._publish_map_markers(final_map_data)
         self._publish_pose_stamped(estimated_pose, odom_msg.header.stamp)
-
+        self._publish_cone_map(final_map_data, odom_msg.header.stamp)
+        self._publish_map_markers(final_map_data, odom_msg.header.stamp)
+        
     def _process_cones(self, cone_array_msg: ConeArray, rx, ry, r_yaw):
         """
         Extracts cones. If frame_id is 'map', transforms them to 'base_link' 
         so SLAM can process them as range/bearing.
         """
-        all_cones_rb = []   # store [range, bearing] of all detected cones
-        all_cone_types = []  # store cone type of all detected cones as enum integer given in common_msgs/Cone.msg
+        all_cones_rb = []   # store [range, bearing, cone_type] of all detected cones
         
         is_map_frame = (cone_array_msg.header.frame_id == "map")
-        
+        LIDAR_X_OFFSET = 0.52     # The offset of velodyne coordinate to base_link coordinate.
         cone_mapping = [
             (cone_array_msg.yellow_cones, Cone.YELLOW),
             (cone_array_msg.blue_cones, Cone.BLUE),
@@ -329,11 +355,6 @@ class FastSLAMNode(Node):
         for cone_list, cone_type in cone_mapping:
             for cone in cone_list:
                 cx, cy = cone.position.x, cone.position.y
-                
-                # Filter noise
-                if abs(cx) < 1e-3 and abs(cy) < 1e-3:
-                    continue
-                
                 if is_map_frame:
                     # TRANSFORM: Global (Map) -> Local (Base Link)
                     dx = cx - rx
@@ -344,14 +365,29 @@ class FastSLAMNode(Node):
                     local_x = dx * cos_v + dy * sin_v
                     local_y = -dx * sin_v + dy * cos_v
                 else:
-                    # Already local
-                    local_x, local_y = cx, cy
+                    # Frame is 'velodyne', so we add offset to get to 'base_link'
+                    local_x = cx + LIDAR_X_OFFSET
+                    local_y = cy
 
                 r, beta = xy_to_range_bearing(local_x, local_y)
-                all_cones_rb.append([r, beta])
-                all_cone_types.append(cone_type)
-                
-        return np.array(all_cones_rb, dtype=KERN_FLOAT), all_cone_types
+
+                #- FILTER 1: HARD DISTANCE CUTOFF ---
+                # Anything further than 15m is too noisy -> Ignore it.
+                if r > 15.0 or r<1.5:
+                   continue
+                all_cones_rb.append([r, beta,float(cone_type)])            
+        # Convert to numpy for sorting
+        measurements_rb = np.array(all_cones_rb, dtype=KERN_FLOAT)
+        
+        #- FILTER 2: KEEP ONLY CLOSEST 50 ---
+        if len(measurements_rb) > 0:
+            # Sort by distance (column 0)
+            sorted_indices = np.argsort(measurements_rb[:, 0])
+            measurements_rb = measurements_rb[sorted_indices]
+            # Keep cones till allowed max limit and forget others
+            if len(measurements_rb) > self.MAX_MEASUREMENTS:
+                measurements_rb = measurements_rb[:self.MAX_MEASUREMENTS]    
+        return measurements_rb
 
     def _publish_transforms(self, odom_msg: Odometry, estimated_pose: np.ndarray):
         x_map, y_map, theta_map = estimated_pose[0], estimated_pose[1], estimated_pose[2]
@@ -384,29 +420,52 @@ class FastSLAMNode(Node):
         q_msg = yaw_to_quaternion(theta)
         pose_msg = PoseStamped()
         pose_msg.header.stamp = timestamp
-        pose_msg.header.frame_id = "map"
+        pose_msg.header.frame_id = "map" 
         pose_msg.pose.position.x = x
         pose_msg.pose.position.y = y
         pose_msg.pose.orientation = q_msg
         self.pose_pub.publish(pose_msg)
+    def _publish_cone_map(self, final_map_data, stamp):
+        msg = ConeArray()
+        msg.header.stamp = stamp
+        msg.header.frame_id = "map"      # Check if required is map or odom
 
-    def _publish_map_markers(self, final_map_data):
+        for lm in final_map_data:
+            cone = Cone()
+            cone.position.x = float(lm["position"][0])
+            cone.position.y = float(lm["position"][1])
+            cone.position.z = 0.15
+            cone.type = int(lm["type"])
+
+            if cone.type == Cone.YELLOW:
+                msg.yellow_cones.append(cone)
+            elif cone.type == Cone.BLUE:
+                msg.blue_cones.append(cone)
+            elif cone.type == Cone.ORANGE:
+                msg.orange_cones.append(cone)
+            elif cone.type == Cone.LARGE_ORANGE:
+                msg.large_orange_cones.append(cone)
+            else:
+                msg.unknown_cones.append(cone)
+        self.cone_map_pub.publish(msg)
+
+    def _publish_map_markers(self,final_map_data , stamp):
         marker_array = MarkerArray()
-        for i, lm_data in enumerate(final_map_data):
+        # Use 'enumerate' to generate a temporary ID since we don't have a buffer ID anymore
+        for i, lm in enumerate(final_map_data):
             marker = Marker()
             marker.header.frame_id = "map"
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "slam_cones"
-            marker.id = i
+            marker.header.stamp = stamp
+            marker.ns = "cone_map_markers"
+            marker.id = i # Simple index ID
             marker.type = Marker.CYLINDER
             marker.action = Marker.ADD
-            marker.pose.position.x = float(lm_data["position"][0])
-            marker.pose.position.y = float(lm_data["position"][1])
-            marker.pose.position.z = 0.5
             
-            cone_type = lm_data["type"]
-            color = get_cone_color(cone_type)
+            marker.pose.position.x = float(lm["position"][0])
+            marker.pose.position.y = float(lm["position"][1])
+            marker.pose.position.z = 0.15
             
+            color = get_cone_color(int(lm["type"]))
             marker.scale.x = 0.2
             marker.scale.y = 0.2
             marker.scale.z = 0.5
@@ -415,8 +474,13 @@ class FastSLAMNode(Node):
             marker.color.g = color["g"]
             marker.color.b = color["b"]
             marker_array.markers.append(marker)
-        self.map_pub.publish(marker_array)
-
+        
+        # IMPORTANT: Delete markers that are no longer in the list
+        delete_marker = Marker()
+        delete_marker.action = Marker.DELETEALL
+        marker_array.markers.insert(0, delete_marker)
+        
+        self.map_markers_pub.publish(marker_array)
 
 def main(args=None):
     rclpy.init(args=args)
