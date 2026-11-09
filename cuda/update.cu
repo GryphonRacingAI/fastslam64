@@ -161,7 +161,7 @@ __device__ void remove_landmark(double *particle, int i, int max_landmarks)
 __device__ void vecmul(double *A, double *u, double *v)
 {
     double a = A[0]; double b = A[1]; double c = A[2]; double d = A[3];
-    double e = u[0]; double f = v[1];
+    double e = u[0]; double f = u[1];
     v[0] = a*e + b*f;
     v[1] = c*e + d*f;
 }
@@ -248,7 +248,9 @@ __device__ void add_measurements_as_landmarks(double *particle, landmark_measure
     double *measurement_cov = measurements->measurement_cov;
 
     for(int i = 0; i < n_measurements; i++) {
-        add_measurement_as_landmark(particle, measurements->measurements[i], measurement_cov, max_landmarks);
+        double R_far[] = { <<FAR_VAR_R>>, 0.0, 0.0, <<FAR_VAR_B>> };
+        double *R_i = (measurements->measurements[i][0] > <<FAR_RANGE>>) ? R_far : measurement_cov;
+        add_measurement_as_landmark(particle, measurements->measurements[i], R_i, max_landmarks);
     }
 }
 
@@ -298,10 +300,15 @@ __device__ void update_landmarks(int id, double *particle, landmark_measurements
     }
 
     for(int i = 0; i < n_measurements; i++) {
+        double R_far[] = { <<FAR_VAR_R>>, 0.0, 0.0, <<FAR_VAR_B>> };
+        double *R_i = (measurements->measurements[i][0] > <<FAR_RANGE>>) ? R_far : measurement_cov;
         double best = 1000000.0;
         int best_idx = -1;
 
         for(int j = 0; j < n_in_range; j++) {
+            double lm_type = get_landmark_color(particle, in_range[j], max_landmarks)[0];
+            double ms_type = measurements->measurements[i][2];
+            if (lm_type != ms_type && lm_type != 0.0 && ms_type != 0.0) continue;
             double dist = compute_dist(particle, in_range[j], measurements->measurements[i], measurement_cov);
 
             if(dist <= thresh && dist < best) {
@@ -341,7 +348,7 @@ __device__ void update_landmarks(int id, double *particle, landmark_measurements
 
             double *landmark_cov = get_cov(particle, best_idx, max_landmarks);
         
-            matmul_jacobian(H, landmark_cov, measurement_cov, S);
+            matmul_jacobian(H, landmark_cov, R_i, S);
             double S_inv[] = {0, 0, 0, 0};
             pinv(S, S_inv);
 
@@ -376,7 +383,11 @@ __device__ void update_landmarks(int id, double *particle, landmark_measurements
             increment_landmark_prob(particle, best_idx, max_landmarks);
 
         } else {
-            add_measurement_as_landmark(particle, measurements->measurements[i], measurement_cov, max_landmarks);
+            if (<<NEW_LM_D2>> > 0.0) {
+                double det_r = R_i[0] * R_i[3] - R_i[1] * R_i[2];
+                particle[3] *= exp(-0.5 * <<NEW_LM_D2>>) / (2.0 * M_PI * sqrt(det_r));
+            }
+            add_measurement_as_landmark(particle, measurements->measurements[i], R_i, max_landmarks);
         }
     }
 
