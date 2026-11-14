@@ -31,6 +31,18 @@ OPTIONAL_ARGS = {
     "FAR_VAR_B": 1.0,   # bearing variance (rad^2) for far measurements
     "NEW_LM_D2": 0.0,   # > 0: a measurement that starts a new landmark scales the particle weight by the
                         # likelihood of a measurement at this squared Mahalanobis distance (0 = off)
+    # Data association (update.cu, update_landmarks):
+    "COLOR_MISMATCH_FACTOR": 1.0,  # association distance to a landmark of another type is multiplied by this.
+                                   # 1 = type ignored (as before), > 1 = soft gate (a landmark of the wrong type
+                                   # must be that much closer), 1e9 = hard gate (never matched)
+    "COLOR_VOTE": 0,    # 1: a landmark's type is a vote. A matched measurement of another type takes one hit
+                        # (4) off the existence score instead of adding it; when the score falls below the
+                        # creation value (15) the landmark takes the measurement's type and restarts at 15.
+                        # Needs COLOR_MISMATCH_FACTOR < 1e9, otherwise mismatches are never matched.
+    "GATE_D2": 0.0,     # > 0: gate and choose by squared Mahalanobis distance in (range, bearing) with the
+                        # innovation covariance H P H^T + R_i (R_i = the far covariance beyond FAR_RANGE), so the
+                        # gate widens with the measurement's uncertainty; 9.21 = 99 % for 2 dof. 0 = Euclidean
+                        # distance against THRESHOLD (as before).
 }
 
 
